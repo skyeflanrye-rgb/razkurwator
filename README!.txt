@@ -6,7 +6,7 @@
 pkg update && pkg upgrade -y
 pkg install python3 python3-pip git -y
 git clone https://github.com/skyeflanrye-rgb/razkurwator/
-cd TGPars
+cd razkurwator
 python3 setup.py --install
 ```
 
