@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-TGPars — Scrape members from one or ALL Telegram supergroups into members.csv.
+TGPars — Scrape ACTIVE members from one or ALL Telegram supergroups.
+Filters out bots, deleted accounts, and users with no recent activity.
 Usage: python3 pars.py
 """
 
@@ -9,10 +10,15 @@ import csv
 import os
 import sys
 import time
+from datetime import datetime, timezone
 
 from telethon.sync import TelegramClient
-from telethon.tl.functions.messages import GetDialogsRequest
-from telethon.tl.types import InputPeerEmpty
+from telethon.tl.functions.messages import GetDialogsRequest, GetHistoryRequest
+from telethon.tl.types import (
+    InputPeerEmpty,
+    InputPeerChannel,
+    PeerUser,
+)
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
 RED = "\033[1;31m"
@@ -21,9 +27,10 @@ CYN = "\033[1;36m"
 YLW = "\033[1;33m"
 RST = "\033[0m"
 
-CHUNK_SIZE  = 200   # диалогов за один запрос
-OUTPUT_FILE = "members.csv"
-DELAY       = 2     # секунд между группами (защита от flood-limit)
+CHUNK_SIZE   = 200    # диалогов за один запрос
+MSG_LIMIT    = 500    # сообщений истории для поиска активных
+OUTPUT_FILE  = "members.csv"
+DELAY        = 2      # секунд между группами
 
 
 def banner() -> None:
@@ -53,7 +60,7 @@ def load_config() -> tuple[str, str, str]:
 
 
 def fetch_all_groups(client: TelegramClient) -> list:
-    """Загружает ВСЕ супергруппы из диалогов (обходит лимит 200 за запрос)."""
+    """Загружает ВСЕ супергруппы (пагинация через offset)."""
     groups      = []
     seen_ids    = set()
     offset_date = None
@@ -79,11 +86,9 @@ def fetch_all_groups(client: TelegramClient) -> list:
                 groups.append(chat)
                 seen_ids.add(chat.id)
 
-        # Если диалогов меньше chunk_size — все загружены
         if len(result.dialogs) < CHUNK_SIZE:
             break
 
-        # Смещение для следующей страницы
         last_msg    = result.messages[-1]
         last_dlg    = result.dialogs[-1]
         offset_id   = last_msg.id
@@ -95,7 +100,7 @@ def fetch_all_groups(client: TelegramClient) -> list:
 
 
 def pick_mode(groups: list) -> tuple[str, list]:
-    """Предлагает выбрать режим: одна группа или все сразу."""
+    """Режим: одна группа или все сразу."""
     print(f"{GRN}[1]{CYN} Парсить одну группу")
     print(f"{GRN}[2]{CYN} Парсить ВСЕ группы ({YLW}{len(groups)}{CYN} шт.) → общая база{RST}\n")
 
@@ -113,7 +118,7 @@ def pick_mode(groups: list) -> tuple[str, list]:
 
 
 def pick_one_group(groups: list) -> list:
-    """Показывает список и возвращает одну выбранную группу."""
+    """Список групп → выбор одной."""
     print(f"\n{GRN}[+] Выбери группу:{RST}\n")
     for i, g in enumerate(groups):
         print(f"{GRN}[{CYN}{i:>3}{GRN}]{CYN} {g.title}{RST}")
@@ -127,11 +132,85 @@ def pick_one_group(groups: list) -> list:
             print(f"{RED}[!] Неверный выбор, попробуй снова.{RST}")
 
 
-def scrape_group(client: TelegramClient, group: object) -> list[dict]:
-    """Возвращает список участников одной группы."""
+def is_active_user(user) -> bool:
+    """
+    Возвращает True если пользователь — живой активный человек.
+
+    Отсеиваем:
+      • bot=True           — официальные боты
+      • deleted=True       — удалённые аккаунты
+      • fake=True          — аккаунты помечены Telegram как фейк
+      • scam=True          — скам-аккаунты
+      • first_name is None — пустые/удалённые профили
+    """
+    if getattr(user, "bot", False):
+        return False
+    if getattr(user, "deleted", False):
+        return False
+    if getattr(user, "fake", False):
+        return False
+    if getattr(user, "scam", False):
+        return False
+    if not user.first_name and not user.last_name and not user.username:
+        return False
+    return True
+
+
+def get_active_ids_from_history(
+    client: TelegramClient,
+    group,
+    limit: int = MSG_LIMIT,
+) -> set[int]:
+    """
+    Читает последние `limit` сообщений группы и собирает id тех,
+    кто реально писал (оставлял сообщения/комментарии).
+    """
+    active_ids: set[int] = set()
+    try:
+        peer = InputPeerChannel(group.id, group.access_hash)
+        result = client(GetHistoryRequest(
+            peer=peer,
+            offset_id=0,
+            offset_date=None,
+            add_offset=0,
+            limit=limit,
+            max_id=0,
+            min_id=0,
+            hash=0,
+        ))
+        for msg in result.messages:
+            if msg.from_id and isinstance(msg.from_id, PeerUser):
+                active_ids.add(msg.from_id.user_id)
+    except Exception:
+        pass  # если нет доступа к истории — пропускаем
+    return active_ids
+
+
+def scrape_group(
+    client: TelegramClient,
+    group,
+    active_only: bool = True,
+) -> list[dict]:
+    """
+    Возвращает участников группы.
+    Если active_only=True — только те, кто писал в последних MSG_LIMIT сообщениях
+    И прошёл базовую проверку (не бот, не удалён и т.д.).
+    """
     participants = client.get_participants(group, aggressive=True)
+
+    # ID тех, кто реально писал
+    active_ids = get_active_ids_from_history(client, group) if active_only else set()
+
     members: list[dict] = []
     for user in participants:
+        # 1. Базовая фильтрация (бот / удалён / скам / пустой)
+        if not is_active_user(user):
+            continue
+
+        # 2. Если включён режим active_only — только писавшие в чат
+        if active_only and active_ids and user.id not in active_ids:
+            continue
+
         first = (user.first_name or "").strip()
         last  = (user.last_name  or "").strip()
         members.append({
@@ -142,12 +221,17 @@ def scrape_group(client: TelegramClient, group: object) -> list[dict]:
             "group":       group.title,
             "group_id":    group.id,
         })
+
     return members
 
 
-def scrape_all(client: TelegramClient, groups: list) -> list[dict]:
+def scrape_all(
+    client: TelegramClient,
+    groups: list,
+    active_only: bool = True,
+) -> list[dict]:
     """Парсит все группы, дедуплицирует по user_id."""
-    all_members: dict[int, dict] = {}   # id → member
+    all_members: dict[int, dict] = {}
     total = len(groups)
 
     for idx, group in enumerate(groups, 1):
@@ -157,13 +241,16 @@ def scrape_all(client: TelegramClient, groups: list) -> list[dict]:
             end="", flush=True,
         )
         try:
-            members = scrape_group(client, group)
-            new = sum(
-                1 for m in members
-                if m["id"] not in all_members
-                and not all_members.update({m["id"]: m})  # type: ignore[func-returns-value]
+            members = scrape_group(client, group, active_only=active_only)
+            new = 0
+            for m in members:
+                if m["id"] not in all_members:
+                    all_members[m["id"]] = m
+                    new += 1
+            print(
+                f"{GRN}+{new} активных  "
+                f"(уникальных в базе: {CYN}{len(all_members)}{GRN}){RST}"
             )
-            print(f"{GRN}+{new} новых  (уникальных: {CYN}{len(all_members)}{GRN}){RST}")
         except Exception as exc:
             print(f"{RED}ошибка — {exc}{RST}")
 
@@ -177,7 +264,7 @@ def save_members(members: list[dict], filepath: str) -> None:
     """Записывает список участников в CSV."""
     print(
         f"\n{GRN}[+] Сохраняю {CYN}{len(members)}{GRN} "
-        f"уникальных участников → {CYN}{filepath}{RST}"
+        f"участников → {CYN}{filepath}{RST}"
     )
 
     with open(filepath, "w", encoding="UTF-8", newline="") as f:
@@ -223,16 +310,42 @@ def main() -> None:
         print(f"{RED}[!] Супергрупп не найдено в аккаунте.{RST}")
         sys.exit(1)
 
+    # Режим фильтрации
+    print(f"{GRN}Фильтр активности:{RST}")
+    print(f"{GRN}[1]{CYN} Только активные (писали в последних {MSG_LIMIT} сообщениях) {YLW}← рекомендуется")
+    print(f"{GRN}[2]{CYN} Все живые люди (без ботов и удалённых, без проверки активности){RST}\n")
+
+    active_only = True
+    while True:
+        try:
+            f = int(input(f"{GRN}Выбери фильтр: {RED}"))
+            print(RST, end="")
+            if f == 1:
+                active_only = True
+                break
+            elif f == 2:
+                active_only = False
+                break
+            print(f"{RED}[!] Введи 1 или 2.{RST}")
+        except ValueError:
+            print(f"{RED}[!] Введи число.{RST}")
+
+    print()
     mode, selected = pick_mode(groups)
     print()
 
     if mode == "single":
-        print(f"{GRN}[+] Парсю: {CYN}{selected[0].title}{RST}\n")
-        raw     = scrape_group(client, selected[0])
+        group = selected[0]
+        print(f"{GRN}[+] Парсю: {CYN}{group.title}{RST}\n")
+        raw     = scrape_group(client, group, active_only=active_only)
         members = list({m["id"]: m for m in raw}.values())
+        print(f"{GRN}[+] Найдено активных участников: {CYN}{len(members)}{RST}")
     else:
-        print(f"{GRN}[+] Запускаю парсинг всех {CYN}{len(selected)}{GRN} групп …{RST}\n")
-        members = scrape_all(client, selected)
+        print(
+            f"{GRN}[+] Запускаю парсинг всех {CYN}{len(selected)}{GRN} групп "
+            f"(фильтр: {'активные' if active_only else 'все живые'}) …{RST}\n"
+        )
+        members = scrape_all(client, selected, active_only=active_only)
 
     save_members(members, OUTPUT_FILE)
 
