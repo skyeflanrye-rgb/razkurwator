@@ -10,7 +10,6 @@ import csv
 import os
 import sys
 import time
-from datetime import datetime, timezone
 
 from telethon.sync import TelegramClient
 from telethon.tl.functions.messages import GetDialogsRequest, GetHistoryRequest
@@ -18,6 +17,11 @@ from telethon.tl.types import (
     InputPeerEmpty,
     InputPeerChannel,
     PeerUser,
+)
+from telethon.errors import (
+    ChannelPrivateError,
+    ChatAdminRequiredError,
+    RPCError,
 )
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
@@ -194,9 +198,24 @@ def scrape_group(
     """
     Возвращает участников группы.
     Если active_only=True — только те, кто писал в последних MSG_LIMIT сообщениях
-    И прошёл базовую проверку (не бот, не удалён и т.д.).
+    и прошёл базовую проверку (не бот, не удалён и т.д.).
+
+    Возможные пропуски:
+      CHANNEL_MONOFORUM_UNSUPPORTED — чат-комментарии канала (не супергруппа)
+      CHANNEL_PRIVATE               — нет доступа к группе
+      CHAT_ADMIN_REQUIRED           — нужны права администратора
     """
-    participants = client.get_participants(group, aggressive=True)
+    try:
+        participants = client.get_participants(group, aggressive=True)
+    except RPCError as e:
+        code = getattr(e, "message", str(e))
+        if "CHANNEL_MONOFORUM_UNSUPPORTED" in code:
+            raise RuntimeError("monoforum — пропускаем (Discussion-чат канала)")
+        if "CHANNEL_PRIVATE" in code:
+            raise RuntimeError("группа приватная — нет доступа")
+        if "CHAT_ADMIN_REQUIRED" in code:
+            raise RuntimeError("нужны права администратора")
+        raise
 
     # ID тех, кто реально писал
     active_ids = get_active_ids_from_history(client, group) if active_only else set()
@@ -232,7 +251,9 @@ def scrape_all(
 ) -> list[dict]:
     """Парсит все группы, дедуплицирует по user_id."""
     all_members: dict[int, dict] = {}
-    total = len(groups)
+    total    = len(groups)
+    skipped  = 0
+    failed   = 0
 
     for idx, group in enumerate(groups, 1):
         print(
@@ -251,12 +272,22 @@ def scrape_all(
                 f"{GRN}+{new} активных  "
                 f"(уникальных в базе: {CYN}{len(all_members)}{GRN}){RST}"
             )
+        except RuntimeError as e:
+            # Ожидаемые пропуски (monoforum, приватная и т.д.)
+            print(f"{YLW}пропущено — {e}{RST}")
+            skipped += 1
         except Exception as exc:
             print(f"{RED}ошибка — {exc}{RST}")
+            failed += 1
 
         if idx < total:
             time.sleep(DELAY)
 
+    print(
+        f"\n{GRN}Итог: обработано {CYN}{total - skipped - failed}{GRN} | "
+        f"пропущено {CYN}{skipped}{GRN} | "
+        f"ошибок {CYN}{failed}{RST}"
+    )
     return list(all_members.values())
 
 
