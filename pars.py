@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-TGPars — Scrape ACTIVE members from one or ALL Telegram supergroups.
-Filters out bots, deleted accounts, and users with no recent activity.
+TGPars — Scrape members from one or ALL Telegram supergroups into members.csv.
 Usage: python3 pars.py
 """
 
@@ -12,15 +11,10 @@ import sys
 import time
 
 from telethon.sync import TelegramClient
-from telethon.tl.functions.messages import GetDialogsRequest, GetHistoryRequest
-from telethon.tl.types import (
-    InputPeerEmpty,
-    InputPeerChannel,
-    PeerUser,
-)
+from telethon.tl.functions.messages import GetDialogsRequest
+from telethon.tl.types import InputPeerEmpty
 from telethon.errors import (
-    ChannelPrivateError,
-    ChatAdminRequiredError,
+    FloodWaitError,
     RPCError,
 )
 
@@ -31,10 +25,11 @@ CYN = "\033[1;36m"
 YLW = "\033[1;33m"
 RST = "\033[0m"
 
-CHUNK_SIZE   = 200    # диалогов за один запрос
-MSG_LIMIT    = 500    # сообщений истории для поиска активных
-OUTPUT_FILE  = "members.csv"
-DELAY        = 2      # секунд между группами
+CHUNK_SIZE  = 200   # диалогов за один запрос
+OUTPUT_FILE = "members.csv"
+DELAY       = 2     # секунд между группами
+FLOOD_EXTRA = 10    # доп. секунд поверх требования Telegram при FloodWait
+MAX_RETRIES = 3     # попыток повтора на одну группу
 
 
 def banner() -> None:
@@ -61,6 +56,16 @@ def load_config() -> tuple[str, str, str]:
         banner()
         print(f"{RED}[!] Сначала выполни: python3 setup.py --config\n{RST}")
         sys.exit(1)
+
+
+def flood_wait(seconds: int, label: str = "") -> None:
+    """Ждёт нужное время при FloodWaitError с обратным отсчётом."""
+    total = seconds + FLOOD_EXTRA
+    prefix = f"{YLW}[~] FloodWait{f' ({label})' if label else ''}: ждём"
+    for remaining in range(total, 0, -1):
+        print(f"\r{prefix} {remaining:>4}s …{RST}", end="", flush=True)
+        time.sleep(1)
+    print(f"\r{GRN}[✓] FloodWait снят, продолжаем.           {RST}")
 
 
 def fetch_all_groups(client: TelegramClient) -> list:
@@ -136,98 +141,40 @@ def pick_one_group(groups: list) -> list:
             print(f"{RED}[!] Неверный выбор, попробуй снова.{RST}")
 
 
-def is_active_user(user) -> bool:
+def scrape_group(client: TelegramClient, group) -> list[dict]:
     """
-    Возвращает True если пользователь — живой активный человек.
+    Возвращает всех участников группы с retry при FloodWait.
 
-    Отсеиваем:
-      • bot=True           — официальные боты
-      • deleted=True       — удалённые аккаунты
-      • fake=True          — аккаунты помечены Telegram как фейк
-      • scam=True          — скам-аккаунты
-      • first_name is None — пустые/удалённые профили
-    """
-    if getattr(user, "bot", False):
-        return False
-    if getattr(user, "deleted", False):
-        return False
-    if getattr(user, "fake", False):
-        return False
-    if getattr(user, "scam", False):
-        return False
-    if not user.first_name and not user.last_name and not user.username:
-        return False
-    return True
-
-
-def get_active_ids_from_history(
-    client: TelegramClient,
-    group,
-    limit: int = MSG_LIMIT,
-) -> set[int]:
-    """
-    Читает последние `limit` сообщений группы и собирает id тех,
-    кто реально писал (оставлял сообщения/комментарии).
-    """
-    active_ids: set[int] = set()
-    try:
-        peer = InputPeerChannel(group.id, group.access_hash)
-        result = client(GetHistoryRequest(
-            peer=peer,
-            offset_id=0,
-            offset_date=None,
-            add_offset=0,
-            limit=limit,
-            max_id=0,
-            min_id=0,
-            hash=0,
-        ))
-        for msg in result.messages:
-            if msg.from_id and isinstance(msg.from_id, PeerUser):
-                active_ids.add(msg.from_id.user_id)
-    except Exception:
-        pass  # если нет доступа к истории — пропускаем
-    return active_ids
-
-
-def scrape_group(
-    client: TelegramClient,
-    group,
-    active_only: bool = True,
-) -> list[dict]:
-    """
-    Возвращает участников группы.
-    Если active_only=True — только те, кто писал в последних MSG_LIMIT сообщениях
-    и прошёл базовую проверку (не бот, не удалён и т.д.).
-
-    Возможные пропуски:
-      CHANNEL_MONOFORUM_UNSUPPORTED — чат-комментарии канала (не супергруппа)
-      CHANNEL_PRIVATE               — нет доступа к группе
+    Пропускаемые случаи (RuntimeError):
+      CHANNEL_MONOFORUM_UNSUPPORTED — Discussion-чат канала
+      CHANNEL_PRIVATE               — нет доступа
       CHAT_ADMIN_REQUIRED           — нужны права администратора
     """
-    try:
-        participants = client.get_participants(group, aggressive=True)
-    except RPCError as e:
-        code = getattr(e, "message", str(e))
-        if "CHANNEL_MONOFORUM_UNSUPPORTED" in code:
-            raise RuntimeError("monoforum — пропускаем (Discussion-чат канала)")
-        if "CHANNEL_PRIVATE" in code:
-            raise RuntimeError("группа приватная — нет доступа")
-        if "CHAT_ADMIN_REQUIRED" in code:
-            raise RuntimeError("нужны права администратора")
-        raise
-
-    # ID тех, кто реально писал
-    active_ids = get_active_ids_from_history(client, group) if active_only else set()
+    participants = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            participants = client.get_participants(group, aggressive=True)
+            break
+        except FloodWaitError as e:
+            if attempt == MAX_RETRIES:
+                raise RuntimeError(f"FloodWait {e.seconds}s — исчерпаны попытки")
+            flood_wait(e.seconds, label=group.title)
+        except RPCError as e:
+            code = getattr(e, "message", str(e))
+            if "CHANNEL_MONOFORUM_UNSUPPORTED" in code:
+                raise RuntimeError("monoforum — пропускаем (Discussion-чат канала)")
+            if "CHANNEL_PRIVATE" in code:
+                raise RuntimeError("группа приватная — нет доступа")
+            if "CHAT_ADMIN_REQUIRED" in code:
+                raise RuntimeError("нужны права администратора")
+            raise
 
     members: list[dict] = []
     for user in participants:
-        # 1. Базовая фильтрация (бот / удалён / скам / пустой)
-        if not is_active_user(user):
+        # Пропускаем удалённые аккаунты и ботов
+        if getattr(user, "deleted", False):
             continue
-
-        # 2. Если включён режим active_only — только писавшие в чат
-        if active_only and active_ids and user.id not in active_ids:
+        if getattr(user, "bot", False):
             continue
 
         first = (user.first_name or "").strip()
@@ -244,16 +191,12 @@ def scrape_group(
     return members
 
 
-def scrape_all(
-    client: TelegramClient,
-    groups: list,
-    active_only: bool = True,
-) -> list[dict]:
+def scrape_all(client: TelegramClient, groups: list) -> list[dict]:
     """Парсит все группы, дедуплицирует по user_id."""
     all_members: dict[int, dict] = {}
-    total    = len(groups)
-    skipped  = 0
-    failed   = 0
+    total   = len(groups)
+    skipped = 0
+    failed  = 0
 
     for idx, group in enumerate(groups, 1):
         print(
@@ -262,18 +205,17 @@ def scrape_all(
             end="", flush=True,
         )
         try:
-            members = scrape_group(client, group, active_only=active_only)
+            members = scrape_group(client, group)
             new = 0
             for m in members:
                 if m["id"] not in all_members:
                     all_members[m["id"]] = m
                     new += 1
             print(
-                f"{GRN}+{new} активных  "
+                f"{GRN}+{new} участников  "
                 f"(уникальных в базе: {CYN}{len(all_members)}{GRN}){RST}"
             )
         except RuntimeError as e:
-            # Ожидаемые пропуски (monoforum, приватная и т.д.)
             print(f"{YLW}пропущено — {e}{RST}")
             skipped += 1
         except Exception as exc:
@@ -341,42 +283,18 @@ def main() -> None:
         print(f"{RED}[!] Супергрупп не найдено в аккаунте.{RST}")
         sys.exit(1)
 
-    # Режим фильтрации
-    print(f"{GRN}Фильтр активности:{RST}")
-    print(f"{GRN}[1]{CYN} Только активные (писали в последних {MSG_LIMIT} сообщениях) {YLW}← рекомендуется")
-    print(f"{GRN}[2]{CYN} Все живые люди (без ботов и удалённых, без проверки активности){RST}\n")
-
-    active_only = True
-    while True:
-        try:
-            f = int(input(f"{GRN}Выбери фильтр: {RED}"))
-            print(RST, end="")
-            if f == 1:
-                active_only = True
-                break
-            elif f == 2:
-                active_only = False
-                break
-            print(f"{RED}[!] Введи 1 или 2.{RST}")
-        except ValueError:
-            print(f"{RED}[!] Введи число.{RST}")
-
-    print()
     mode, selected = pick_mode(groups)
     print()
 
     if mode == "single":
         group = selected[0]
         print(f"{GRN}[+] Парсю: {CYN}{group.title}{RST}\n")
-        raw     = scrape_group(client, group, active_only=active_only)
+        raw     = scrape_group(client, group)
         members = list({m["id"]: m for m in raw}.values())
-        print(f"{GRN}[+] Найдено активных участников: {CYN}{len(members)}{RST}")
+        print(f"{GRN}[+] Найдено участников: {CYN}{len(members)}{RST}")
     else:
-        print(
-            f"{GRN}[+] Запускаю парсинг всех {CYN}{len(selected)}{GRN} групп "
-            f"(фильтр: {'активные' if active_only else 'все живые'}) …{RST}\n"
-        )
-        members = scrape_all(client, selected, active_only=active_only)
+        print(f"{GRN}[+] Запускаю парсинг всех {CYN}{len(selected)}{GRN} групп …{RST}\n")
+        members = scrape_all(client, selected)
 
     save_members(members, OUTPUT_FILE)
 
