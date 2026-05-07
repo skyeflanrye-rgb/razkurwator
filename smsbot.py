@@ -156,7 +156,14 @@ def main() -> None:
         client.send_code_request(phone)
         os.system("clear")
         banner()
-        client.sign_in(phone, input(f"{GRN}[+] Enter the code: {RED}"))
+        try:
+            client.sign_in(phone, input(f"{GRN}[+] Enter the code: {RED}"))
+        except Exception as e:
+            if "SessionPasswordNeeded" in type(e).__name__:
+                print(f"\n{YLW}[!] Включена двухфакторная аутентификация.{RST}")
+                client.sign_in(password=input(f"{GRN}[+] Введи пароль 2FA: {RED}"))
+            else:
+                raise
         print(RST, end="")
 
     os.system("clear")
