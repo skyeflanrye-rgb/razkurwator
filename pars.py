@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TGPars — Scrape members from one or ALL Telegram supergroups into members.csv.
+TGPars — Scrape members from ALL Telegram supergroups into members.csv.
 Usage: python3 pars.py
 """
 
@@ -13,10 +13,7 @@ import time
 from telethon.sync import TelegramClient
 from telethon.tl.functions.messages import GetDialogsRequest
 from telethon.tl.types import InputPeerEmpty
-from telethon.errors import (
-    FloodWaitError,
-    RPCError,
-)
+from telethon.errors import FloodWaitError, RPCError
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
 RED = "\033[1;31m"
@@ -60,7 +57,7 @@ def load_config() -> tuple[str, str, str]:
 
 def flood_wait(seconds: int, label: str = "") -> None:
     """Ждёт нужное время при FloodWaitError с обратным отсчётом."""
-    total = seconds + FLOOD_EXTRA
+    total  = seconds + FLOOD_EXTRA
     prefix = f"{YLW}[~] FloodWait{f' ({label})' if label else ''}: ждём"
     for remaining in range(total, 0, -1):
         print(f"\r{prefix} {remaining:>4}s …{RST}", end="", flush=True)
@@ -68,89 +65,32 @@ def flood_wait(seconds: int, label: str = "") -> None:
     print(f"\r{GRN}[✓] FloodWait снят, продолжаем.           {RST}")
 
 
-def fetch_all_groups(client: TelegramClient) -> list:
-    """Загружает ВСЕ супергруппы (пагинация через offset)."""
-    groups      = []
-    seen_ids    = set()
-    offset_date = None
-    offset_id   = 0
-    offset_peer = InputPeerEmpty()
-
+def fetch_groups(client: TelegramClient) -> list:
+    """Загружает все супергруппы из диалогов одним запросом."""
     print(f"{GRN}[+] Загружаю список групп …{RST}")
 
-    while True:
-        result = client(GetDialogsRequest(
-            offset_date=offset_date,
-            offset_id=offset_id,
-            offset_peer=offset_peer,
-            limit=CHUNK_SIZE,
-            hash=0,
-        ))
+    result = client(GetDialogsRequest(
+        offset_date=None,
+        offset_id=0,
+        offset_peer=InputPeerEmpty(),
+        limit=CHUNK_SIZE,
+        hash=0,
+    ))
 
-        if not result.chats:
-            break
-
-        for chat in result.chats:
-            if getattr(chat, "megagroup", False) and chat.id not in seen_ids:
-                groups.append(chat)
-                seen_ids.add(chat.id)
-
-        if len(result.dialogs) < CHUNK_SIZE:
-            break
-
-        last_msg    = result.messages[-1]
-        last_dlg    = result.dialogs[-1]
-        offset_id   = last_msg.id
-        offset_date = last_msg.date
-        offset_peer = last_dlg.peer
-
+    groups = [c for c in result.chats if getattr(c, "megagroup", False)]
     print(f"{GRN}[+] Найдено супергрупп: {CYN}{len(groups)}{RST}\n")
     return groups
 
 
-def pick_mode(groups: list) -> tuple[str, list]:
-    """Режим: одна группа или все сразу."""
-    print(f"{GRN}[1]{CYN} Парсить одну группу")
-    print(f"{GRN}[2]{CYN} Парсить ВСЕ группы ({YLW}{len(groups)}{CYN} шт.) → общая база{RST}\n")
-
-    while True:
-        try:
-            mode = int(input(f"{GRN}Выбери режим: {RED}"))
-            print(RST, end="")
-            if mode == 1:
-                return "single", pick_one_group(groups)
-            elif mode == 2:
-                return "all", groups
-            print(f"{RED}[!] Введи 1 или 2.{RST}")
-        except ValueError:
-            print(f"{RED}[!] Введи число.{RST}")
-
-
-def pick_one_group(groups: list) -> list:
-    """Список групп → выбор одной."""
-    print(f"\n{GRN}[+] Выбери группу:{RST}\n")
-    for i, g in enumerate(groups):
-        print(f"{GRN}[{CYN}{i:>3}{GRN}]{CYN} {g.title}{RST}")
-
-    while True:
-        try:
-            idx = int(input(f"\n{GRN}[+] Введи номер: {RED}"))
-            print(RST, end="")
-            return [groups[idx]]
-        except (ValueError, IndexError):
-            print(f"{RED}[!] Неверный выбор, попробуй снова.{RST}")
-
-
 def scrape_group(client: TelegramClient, group) -> list[dict]:
     """
-    Возвращает всех участников группы с retry при FloodWait.
+    Возвращает участников группы с retry при FloodWait.
 
-    Пропускаемые случаи (RuntimeError):
+    Тихо пропускает:
       CHANNEL_MONOFORUM_UNSUPPORTED — Discussion-чат канала
       CHANNEL_PRIVATE               — нет доступа
       CHAT_ADMIN_REQUIRED           — нужны права администратора
     """
-    participants = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             participants = client.get_participants(group, aggressive=True)
@@ -162,7 +102,7 @@ def scrape_group(client: TelegramClient, group) -> list[dict]:
         except RPCError as e:
             code = getattr(e, "message", str(e))
             if "CHANNEL_MONOFORUM_UNSUPPORTED" in code:
-                raise RuntimeError("monoforum — пропускаем (Discussion-чат канала)")
+                raise RuntimeError("monoforum (Discussion-чат канала)")
             if "CHANNEL_PRIVATE" in code:
                 raise RuntimeError("группа приватная — нет доступа")
             if "CHAT_ADMIN_REQUIRED" in code:
@@ -171,12 +111,10 @@ def scrape_group(client: TelegramClient, group) -> list[dict]:
 
     members: list[dict] = []
     for user in participants:
-        # Пропускаем удалённые аккаунты и ботов
         if getattr(user, "deleted", False):
             continue
         if getattr(user, "bot", False):
             continue
-
         first = (user.first_name or "").strip()
         last  = (user.last_name  or "").strip()
         members.append({
@@ -187,7 +125,6 @@ def scrape_group(client: TelegramClient, group) -> list[dict]:
             "group":       group.title,
             "group_id":    group.id,
         })
-
     return members
 
 
@@ -239,7 +176,6 @@ def save_members(members: list[dict], filepath: str) -> None:
         f"\n{GRN}[+] Сохраняю {CYN}{len(members)}{GRN} "
         f"участников → {CYN}{filepath}{RST}"
     )
-
     with open(filepath, "w", encoding="UTF-8", newline="") as f:
         writer = csv.writer(f, delimiter=",", lineterminator="\n")
         writer.writerow(["username", "user id", "access hash", "name", "group", "group id"])
@@ -252,7 +188,6 @@ def save_members(members: list[dict], filepath: str) -> None:
                 m["group"],
                 m["group_id"],
             ])
-
     print(f"{GRN}[✓] Готово. Файл сохранён: {CYN}{filepath}{RST}")
 
 
@@ -277,25 +212,13 @@ def main() -> None:
     os.system("clear")
     banner()
 
-    groups = fetch_all_groups(client)
+    groups = fetch_groups(client)
 
     if not groups:
         print(f"{RED}[!] Супергрупп не найдено в аккаунте.{RST}")
         sys.exit(1)
 
-    mode, selected = pick_mode(groups)
-    print()
-
-    if mode == "single":
-        group = selected[0]
-        print(f"{GRN}[+] Парсю: {CYN}{group.title}{RST}\n")
-        raw     = scrape_group(client, group)
-        members = list({m["id"]: m for m in raw}.values())
-        print(f"{GRN}[+] Найдено участников: {CYN}{len(members)}{RST}")
-    else:
-        print(f"{GRN}[+] Запускаю парсинг всех {CYN}{len(selected)}{GRN} групп …{RST}\n")
-        members = scrape_all(client, selected)
-
+    members = scrape_all(client, groups)
     save_members(members, OUTPUT_FILE)
 
 
